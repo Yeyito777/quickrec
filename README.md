@@ -14,6 +14,7 @@ Tiny C X11 screen-region recorder built around a custom selector plus `ffmpeg`.
 ## Dependencies
 
 - `ffmpeg`
+- `dmenu` (for naming the finished recording when you stop)
 - X11 (`DISPLAY` must be set)
 
 ## Build

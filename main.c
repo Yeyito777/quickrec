@@ -1194,6 +1194,97 @@ static int parse_positive_int(const char *text, const char *label, int *value_ou
     return 0;
 }
 
+static int prompt_recording_name(char *buf, size_t bufsz)
+{
+    FILE *fp;
+    int status;
+
+    if (!command_exists("dmenu"))
+        return 0;
+
+    fp = popen("printf '' | dmenu -c -p 'Recording name:' -S '.mp4'", "r");
+    if (!fp)
+        return -1;
+
+    if (!fgets(buf, (int)bufsz, fp))
+        buf[0] = '\0';
+
+    status = pclose(fp);
+    if (status == -1)
+        return -1;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        return 0;
+
+    {
+        size_t len = strlen(buf);
+        while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+            buf[--len] = '\0';
+    }
+
+    return buf[0] != '\0';
+}
+
+static void maybe_rename_recording_with_dmenu(const struct app_paths *paths, char *outfile, size_t outsz)
+{
+    char name[PATH_MAX];
+    char basename[PATH_MAX];
+    char dir[PATH_MAX];
+    char newpath[PATH_MAX];
+    char *slash;
+    int rc;
+
+    if (!outfile || !*outfile)
+        return;
+    if (access(outfile, F_OK) != 0)
+        return;
+
+    rc = prompt_recording_name(name, sizeof(name));
+    if (rc < 0) {
+        fprintf(stderr, "quickrec: warning: failed to prompt for recording name: %s\n", strerror(errno));
+        return;
+    }
+    if (rc == 0)
+        return;
+
+    if (snprintf(basename, sizeof(basename), "%s.mp4", name) >= (int)sizeof(basename)) {
+        fprintf(stderr, "quickrec: warning: chosen recording name is too long\n");
+        return;
+    }
+
+    if (snprintf(dir, sizeof(dir), "%s", outfile) >= (int)sizeof(dir)) {
+        fprintf(stderr, "quickrec: warning: current output path is too long\n");
+        return;
+    }
+
+    slash = strrchr(dir, '/');
+    if (!slash) {
+        if (snprintf(dir, sizeof(dir), ".") >= (int)sizeof(dir))
+            return;
+    } else if (slash == dir) {
+        slash[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+
+    if (path_join(newpath, sizeof(newpath), dir, basename) < 0) {
+        fprintf(stderr, "quickrec: warning: new output path is too long\n");
+        return;
+    }
+
+    if (rename(outfile, newpath) < 0) {
+        fprintf(stderr, "quickrec: warning: failed to rename output: %s\n", strerror(errno));
+        return;
+    }
+
+    if (snprintf(outfile, outsz, "%s", newpath) >= (int)outsz) {
+        fprintf(stderr, "quickrec: warning: renamed output path is too long\n");
+        return;
+    }
+
+    if (write_text_file(paths->outfilefile, outfile) < 0)
+        fprintf(stderr, "quickrec: warning: failed to update last output path: %s\n", strerror(errno));
+}
+
 static int start_recording(int argc, char **argv, const struct app_paths *paths)
 {
     struct geometry geo;
@@ -1388,6 +1479,8 @@ static int stop_recording(const struct app_paths *paths)
 
     if (stop_indicator(paths) < 0)
         fprintf(stderr, "quickrec: warning: failed to stop indicator: %s\n", strerror(errno));
+
+    maybe_rename_recording_with_dmenu(paths, outfile, sizeof(outfile));
 
     if (outfile[0] != '\0')
         printf("quickrec: stopped -> %s\n", outfile);
