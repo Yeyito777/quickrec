@@ -46,7 +46,7 @@ quickrec start -o recordings/test.mp4
 By default recordings are saved to:
 
 ```sh
-~/Workspace/quickrec/recordings/quickrec-YYYY-MM-DD_HH-MM-SS.mp4
+~/Desktop/Videos/quickrec-YYYY-MM-DD_HH-MM-SS.mp4
 ```
 
 You can override the default output directory with:

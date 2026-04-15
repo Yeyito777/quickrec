@@ -348,7 +348,7 @@ static int default_output_path(char *dst, size_t dstsz)
             return -1;
         }
     } else {
-        if (snprintf(dir, sizeof(dir), "%s/Workspace/quickrec/recordings", home) >= (int)sizeof(dir)) {
+        if (snprintf(dir, sizeof(dir), "%s/Desktop/Videos", home) >= (int)sizeof(dir)) {
             errno = ENAMETOOLONG;
             return -1;
         }
