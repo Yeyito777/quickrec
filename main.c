@@ -50,6 +50,7 @@ struct start_options {
 };
 
 static unsigned long alloc_indicator_color(Display *dpy, int screen);
+static int launch_stop_command(void);
 static void make_window_clickthrough(Display *dpy, Window root, Window win, unsigned width, unsigned height);
 static Window create_overlay_window(Display *dpy, Window root,
                                     int x, int y, unsigned width, unsigned height,
@@ -1024,6 +1025,10 @@ static int run_indicator_loop(int notify_fd, const struct geometry *geo)
     int screen_h;
     Window root;
     Window border[4] = {0, 0, 0, 0};
+    KeyCode stop_code;
+    unsigned int stop_mod = ControlMask | ShiftMask;
+    unsigned int locks[] = {0, LockMask, Mod2Mask, LockMask | Mod2Mask};
+    int stop_requested = 0;
     unsigned long pixel;
 
     dpy = XOpenDisplay(NULL);
@@ -1036,6 +1041,7 @@ static int run_indicator_loop(int notify_fd, const struct geometry *geo)
     screen_w = DisplayWidth(dpy, screen);
     screen_h = DisplayHeight(dpy, screen);
     root = RootWindow(dpy, screen);
+    stop_code = XKeysymToKeycode(dpy, XK_Escape);
     pixel = alloc_indicator_color(dpy, screen);
 
     for (int i = 0; i < 4; ++i) {
@@ -1050,6 +1056,10 @@ static int run_indicator_loop(int notify_fd, const struct geometry *geo)
     }
 
     position_border_windows(dpy, border, screen_w, screen_h, geo);
+    if (stop_code != 0) {
+        for (int i = 0; i < 4; ++i)
+            XGrabKey(dpy, stop_code, stop_mod | locks[i], root, True, GrabModeAsync, GrabModeAsync);
+    }
     XFlush(dpy);
 
     if (notify_fd >= 0) {
@@ -1065,12 +1075,28 @@ static int run_indicator_loop(int notify_fd, const struct geometry *geo)
         while (XPending(dpy) > 0) {
             XEvent ev;
             XNextEvent(dpy, &ev);
-            if (ev.type == Expose)
+            if (ev.type == Expose) {
                 XClearWindow(dpy, ev.xexpose.window);
+            } else if (ev.type == KeyPress && ev.xkey.keycode == stop_code && !stop_requested) {
+                pid_t child = fork();
+                if (child == 0) {
+                    if (launch_stop_command() < 0)
+                        _exit(127);
+                }
+                stop_requested = 1;
+                if (stop_code != 0) {
+                    for (int i = 0; i < 4; ++i)
+                        XUngrabKey(dpy, stop_code, stop_mod | locks[i], root);
+                }
+            }
         }
         usleep(50000);
     }
 
+    if (stop_code != 0) {
+        for (int i = 0; i < 4; ++i)
+            XUngrabKey(dpy, stop_code, stop_mod | locks[i], root);
+    }
     for (int i = 0; i < 4; ++i)
         XDestroyWindow(dpy, border[i]);
     XCloseDisplay(dpy);
@@ -1176,6 +1202,30 @@ static int stop_indicator(const struct app_paths *paths)
 
     unlink(paths->indicator_pidfile);
     return 0;
+}
+
+static int get_self_exe_path(char *buf, size_t bufsz)
+{
+    ssize_t n = readlink("/proc/self/exe", buf, bufsz - 1);
+    if (n < 0)
+        return -1;
+    if ((size_t)n >= bufsz - 1) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    buf[n] = '\0';
+    return 0;
+}
+
+static int launch_stop_command(void)
+{
+    char self[PATH_MAX];
+
+    if (get_self_exe_path(self, sizeof(self)) < 0)
+        return -1;
+
+    execl(self, "quickrec", "stop", (char *)NULL);
+    return -1;
 }
 
 static int parse_positive_int(const char *text, const char *label, int *value_out)
@@ -1435,6 +1485,7 @@ static int start_recording(int argc, char **argv, const struct app_paths *paths)
 
     printf("quickrec: recording %dx%d+%d+%d -> %s (pid %ld)\n",
            geo.w, geo.h, geo.x, geo.y, opt.output, (long)pid);
+    printf("quickrec: stop hotkey -> Ctrl+Shift+Esc\n");
     return 0;
 }
 

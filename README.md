@@ -39,6 +39,8 @@ quickrec stop                          # stop the current recording
 quickrec status                        # see whether it is recording
 quickrec start -f 30
 quickrec start -o recordings/test.mp4
+
+# while recording, Ctrl+Shift+Esc triggers the normal stop flow
 ```
 
 By default recordings are saved to:
