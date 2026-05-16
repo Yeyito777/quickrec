@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -26,6 +27,11 @@
 
 #define DEFAULT_FPS 60
 #define DEFAULT_PRESET "ultrafast"
+#define DEFAULT_MIC_SOURCE "default"
+#define DEFAULT_SYSTEM_SOURCE "@DEFAULT_MONITOR@"
+#define DEFAULT_MIC_GAIN "7.875"
+#define DEFAULT_SYSTEM_GAIN "0.675"
+#define DEFAULT_AUDIO_BITRATE "192k"
 #define SELECT_TOLERANCE 2
 
 struct app_paths {
@@ -45,9 +51,14 @@ struct geometry {
 
 struct start_options {
     int fps;
+    int audio;
     const char *display;
     const char *output;
     const char *geometry_text;
+    const char *mic_source;
+    const char *system_source;
+    const char *mic_gain;
+    const char *system_gain;
 };
 
 static unsigned long alloc_indicator_color(Display *dpy, int screen);
@@ -72,12 +83,23 @@ static void usage(FILE *out)
         "  -f, --fps N             Capture framerate (default: %d)\n"
         "  -g, --geometry SPEC     Use WxH+X+Y instead of interactive selection\n"
         "  -o, --output PATH       Output file (.mp4)\n"
+        "      --no-audio          Record video only\n"
+        "      --mic-source NAME   PulseAudio mic source (default: %s)\n"
+        "      --system-source NAME PulseAudio system source (default: %s)\n"
+        "      --mic-gain GAIN     Microphone gain multiplier (default: %s)\n"
+        "      --system-gain GAIN  System audio gain multiplier (default: %s)\n"
         "\n"
         "Environment:\n"
         "  DISPLAY                 X11 display to capture (required)\n"
         "  QUICKREC_FPS            Default FPS override\n"
-        "  QUICKREC_OUTPUT_DIR     Default output directory override\n",
-        DEFAULT_FPS);
+        "  QUICKREC_OUTPUT_DIR     Default output directory override\n"
+        "  QUICKREC_AUDIO          Set to 0/false/no/off for video-only\n"
+        "  QUICKREC_MIC_SOURCE     PulseAudio mic source override\n"
+        "  QUICKREC_SYSTEM_SOURCE  PulseAudio system source override\n"
+        "  QUICKREC_MIC_GAIN       Microphone gain multiplier override\n"
+        "  QUICKREC_SYSTEM_GAIN    System audio gain multiplier override\n",
+        DEFAULT_FPS, DEFAULT_MIC_SOURCE, DEFAULT_SYSTEM_SOURCE,
+        DEFAULT_MIC_GAIN, DEFAULT_SYSTEM_GAIN);
 }
 
 static int path_join(char *dst, size_t dstsz, const char *a, const char *b)
@@ -867,9 +889,12 @@ static int spawn_ffmpeg(const struct geometry *geo, const struct start_options *
         int logfd;
         int devnull;
         int child_errno;
+        char *args[64];
+        size_t argi = 0;
         char fpsbuf[16];
         char sizebuf[64];
         char inputbuf[128];
+        char filterbuf[512];
 
         close(errpipe[0]);
 
@@ -908,21 +933,74 @@ static int spawn_ffmpeg(const struct geometry *geo, const struct start_options *
         snprintf(fpsbuf, sizeof(fpsbuf), "%d", opt->fps);
         snprintf(sizebuf, sizeof(sizebuf), "%dx%d", geo->w, geo->h);
         snprintf(inputbuf, sizeof(inputbuf), "%s+%d,%d", opt->display, geo->x, geo->y);
+        if (opt->audio && snprintf(filterbuf, sizeof(filterbuf),
+                                   "[1:a]volume=%s[mic];[2:a]volume=%s[system];[mic][system]amix=inputs=2:duration=longest:dropout_transition=0,aresample=async=1:first_pts=0[a]",
+                                   opt->mic_gain, opt->system_gain) >= (int)sizeof(filterbuf)) {
+            child_errno = ENAMETOOLONG;
+            (void)!write(errpipe[1], &child_errno, sizeof(child_errno));
+            _exit(1);
+        }
 
-        execlp("ffmpeg",
-               "ffmpeg",
-               "-y",
-               "-hide_banner",
-               "-loglevel", "warning",
-               "-f", "x11grab",
-               "-framerate", fpsbuf,
-               "-video_size", sizebuf,
-               "-i", inputbuf,
-               "-c:v", "libx264",
-               "-preset", DEFAULT_PRESET,
-               "-pix_fmt", "yuv420p",
-               opt->output,
-               (char *)NULL);
+        args[argi++] = "ffmpeg";
+        args[argi++] = "-y";
+        args[argi++] = "-hide_banner";
+        args[argi++] = "-loglevel";
+        args[argi++] = "warning";
+
+        args[argi++] = "-thread_queue_size";
+        args[argi++] = "1024";
+        args[argi++] = "-f";
+        args[argi++] = "x11grab";
+        args[argi++] = "-framerate";
+        args[argi++] = fpsbuf;
+        args[argi++] = "-video_size";
+        args[argi++] = sizebuf;
+        args[argi++] = "-i";
+        args[argi++] = inputbuf;
+
+        if (opt->audio) {
+            args[argi++] = "-thread_queue_size";
+            args[argi++] = "1024";
+            args[argi++] = "-f";
+            args[argi++] = "pulse";
+            args[argi++] = "-i";
+            args[argi++] = (char *)opt->mic_source;
+
+            args[argi++] = "-thread_queue_size";
+            args[argi++] = "1024";
+            args[argi++] = "-f";
+            args[argi++] = "pulse";
+            args[argi++] = "-i";
+            args[argi++] = (char *)opt->system_source;
+
+            args[argi++] = "-filter_complex";
+            args[argi++] = filterbuf;
+            args[argi++] = "-map";
+            args[argi++] = "0:v:0";
+            args[argi++] = "-map";
+            args[argi++] = "[a]";
+        }
+
+        args[argi++] = "-c:v";
+        args[argi++] = "libx264";
+        args[argi++] = "-preset";
+        args[argi++] = DEFAULT_PRESET;
+        args[argi++] = "-pix_fmt";
+        args[argi++] = "yuv420p";
+
+        if (opt->audio) {
+            args[argi++] = "-c:a";
+            args[argi++] = "aac";
+            args[argi++] = "-b:a";
+            args[argi++] = DEFAULT_AUDIO_BITRATE;
+            args[argi++] = "-ac";
+            args[argi++] = "2";
+        }
+
+        args[argi++] = (char *)opt->output;
+        args[argi] = NULL;
+
+        execvp("ffmpeg", args);
 
         child_errno = errno;
         (void)!write(errpipe[1], &child_errno, sizeof(child_errno));
@@ -1267,6 +1345,32 @@ static int parse_positive_int(const char *text, const char *label, int *value_ou
     return 0;
 }
 
+static int parse_positive_double(const char *text, const char *label)
+{
+    char *end;
+    double value;
+
+    errno = 0;
+    value = strtod(text, &end);
+    if (errno != 0 || end == text || *end != '\0' || value <= 0.0 || value > 100.0) {
+        fprintf(stderr, "quickrec: invalid %s: %s\n", label, text);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int env_false(const char *value)
+{
+    if (!value || !*value)
+        return 0;
+
+    return !strcmp(value, "0") ||
+           !strcasecmp(value, "false") ||
+           !strcasecmp(value, "no") ||
+           !strcasecmp(value, "off");
+}
+
 static int prompt_recording_name(char *buf, size_t bufsz)
 {
     FILE *fp;
@@ -1372,9 +1476,31 @@ static int start_recording(int argc, char **argv, const struct app_paths *paths)
     int status;
 
     opt.fps = DEFAULT_FPS;
+    opt.audio = 1;
     opt.display = getenv("DISPLAY");
     opt.output = NULL;
     opt.geometry_text = NULL;
+    opt.mic_source = getenv("QUICKREC_MIC_SOURCE");
+    opt.system_source = getenv("QUICKREC_SYSTEM_SOURCE");
+    opt.mic_gain = getenv("QUICKREC_MIC_GAIN");
+    opt.system_gain = getenv("QUICKREC_SYSTEM_GAIN");
+
+    if (!opt.mic_source || !*opt.mic_source)
+        opt.mic_source = DEFAULT_MIC_SOURCE;
+    if (!opt.system_source || !*opt.system_source)
+        opt.system_source = DEFAULT_SYSTEM_SOURCE;
+    if (!opt.mic_gain || !*opt.mic_gain)
+        opt.mic_gain = DEFAULT_MIC_GAIN;
+    if (!opt.system_gain || !*opt.system_gain)
+        opt.system_gain = DEFAULT_SYSTEM_GAIN;
+
+    if (parse_positive_double(opt.mic_gain, "QUICKREC_MIC_GAIN") < 0)
+        return 1;
+    if (parse_positive_double(opt.system_gain, "QUICKREC_SYSTEM_GAIN") < 0)
+        return 1;
+
+    if (env_false(getenv("QUICKREC_AUDIO")))
+        opt.audio = 0;
 
     if (!opt.display || !*opt.display) {
         fprintf(stderr, "quickrec: DISPLAY is not set\n");
@@ -1407,6 +1533,38 @@ static int start_recording(int argc, char **argv, const struct app_paths *paths)
                 return 1;
             }
             opt.output = argv[++i];
+        } else if (!strcmp(argv[i], "--no-audio")) {
+            opt.audio = 0;
+        } else if (!strcmp(argv[i], "--audio")) {
+            opt.audio = 1;
+        } else if (!strcmp(argv[i], "--mic-source")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "quickrec: missing value for %s\n", argv[i]);
+                return 1;
+            }
+            opt.mic_source = argv[++i];
+        } else if (!strcmp(argv[i], "--system-source")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "quickrec: missing value for %s\n", argv[i]);
+                return 1;
+            }
+            opt.system_source = argv[++i];
+        } else if (!strcmp(argv[i], "--mic-gain")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "quickrec: missing value for %s\n", argv[i]);
+                return 1;
+            }
+            opt.mic_gain = argv[++i];
+            if (parse_positive_double(opt.mic_gain, "mic gain") < 0)
+                return 1;
+        } else if (!strcmp(argv[i], "--system-gain")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "quickrec: missing value for %s\n", argv[i]);
+                return 1;
+            }
+            opt.system_gain = argv[++i];
+            if (parse_positive_double(opt.system_gain, "system gain") < 0)
+                return 1;
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage(stdout);
             return 0;
@@ -1506,8 +1664,9 @@ static int start_recording(int argc, char **argv, const struct app_paths *paths)
         return 1;
     }
 
-    printf("quickrec: recording %dx%d+%d+%d -> %s (pid %ld)\n",
-           geo.w, geo.h, geo.x, geo.y, opt.output, (long)pid);
+    printf("quickrec: recording %dx%d+%d+%d%s -> %s (pid %ld)\n",
+           geo.w, geo.h, geo.x, geo.y, opt.audio ? " + mic/system audio" : "",
+           opt.output, (long)pid);
     printf("quickrec: stop hotkey -> Ctrl+Shift+Esc\n");
     return 0;
 }
