@@ -16,6 +16,7 @@
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <X11/keysym.h>
 #include <X11/cursorfont.h>
 #include <X11/extensions/shape.h>
 
@@ -627,6 +628,8 @@ static int select_region(struct geometry *geo)
     int dragging = 0;
     int cancelled = 0;
     int done = 0;
+    int keyboard_grabbed = 0;
+    KeySym key;
     struct geometry hover_geo;
     struct geometry drag_geo;
     int have_hover = 0;
@@ -690,6 +693,18 @@ static int select_region(struct geometry *geo)
         XCloseDisplay(dpy);
         return -1;
     }
+
+    for (int i = 0; i < 100; ++i) {
+        if (XGrabKeyboard(dpy, root, False,
+                          GrabModeAsync, GrabModeAsync, CurrentTime) == GrabSuccess) {
+            keyboard_grabbed = 1;
+            break;
+        }
+        usleep(10000);
+    }
+
+    if (!keyboard_grabbed)
+        fprintf(stderr, "quickrec: warning: failed to grab keyboard for selection; Escape cancel disabled\n");
 
     if (query_pointer_window_geometry(dpy, root, &pointer_x, &pointer_y, &hover_geo) == 0) {
         have_hover = 1;
@@ -792,9 +807,17 @@ static int select_region(struct geometry *geo)
                 cancelled = 1;
             }
             break;
+
+        case KeyPress:
+            key = XLookupKeysym(&ev.xkey, 0);
+            if (key == XK_Escape)
+                cancelled = 1;
+            break;
         }
     }
 
+    if (keyboard_grabbed)
+        XUngrabKeyboard(dpy, CurrentTime);
     XUngrabPointer(dpy, CurrentTime);
     for (int i = 0; i < 4; ++i)
         XDestroyWindow(dpy, border[i]);
