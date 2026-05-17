@@ -26,12 +26,11 @@
 #endif
 
 #define DEFAULT_FPS 60
-#define DEFAULT_PRESET "ultrafast"
-#define DEFAULT_MIC_SOURCE "default"
-#define DEFAULT_SYSTEM_SOURCE "@DEFAULT_MONITOR@"
-#define DEFAULT_MIC_GAIN "7.875"
-#define DEFAULT_SYSTEM_GAIN "0.675"
-#define DEFAULT_AUDIO_BITRATE "192k"
+#define DEFAULT_VIDEO_CODEC "h264"
+#define DEFAULT_QUALITY "very_high"
+#define DEFAULT_AUDIO_CODEC "aac"
+#define DEFAULT_MIC_SOURCE "default_input"
+#define DEFAULT_SYSTEM_SOURCE "default_output"
 #define SELECT_TOLERANCE 2
 
 struct app_paths {
@@ -57,8 +56,6 @@ struct start_options {
     const char *geometry_text;
     const char *mic_source;
     const char *system_source;
-    const char *mic_gain;
-    const char *system_gain;
 };
 
 static unsigned long alloc_indicator_color(Display *dpy, int screen);
@@ -84,22 +81,17 @@ static void usage(FILE *out)
         "  -g, --geometry SPEC     Use WxH+X+Y instead of interactive selection\n"
         "  -o, --output PATH       Output file (.mp4)\n"
         "      --no-audio          Record video only\n"
-        "      --mic-source NAME   PulseAudio mic source (default: %s)\n"
-        "      --system-source NAME PulseAudio system source (default: %s)\n"
-        "      --mic-gain GAIN     Microphone gain multiplier (default: %s)\n"
-        "      --system-gain GAIN  System audio gain multiplier (default: %s)\n"
+        "      --mic-source NAME   gpu-screen-recorder mic source (default: %s)\n"
+        "      --system-source NAME gpu-screen-recorder system source (default: %s)\n"
         "\n"
         "Environment:\n"
         "  DISPLAY                 X11 display to capture (required)\n"
         "  QUICKREC_FPS            Default FPS override\n"
         "  QUICKREC_OUTPUT_DIR     Default output directory override\n"
         "  QUICKREC_AUDIO          Set to 0/false/no/off for video-only\n"
-        "  QUICKREC_MIC_SOURCE     PulseAudio mic source override\n"
-        "  QUICKREC_SYSTEM_SOURCE  PulseAudio system source override\n"
-        "  QUICKREC_MIC_GAIN       Microphone gain multiplier override\n"
-        "  QUICKREC_SYSTEM_GAIN    System audio gain multiplier override\n",
-        DEFAULT_FPS, DEFAULT_MIC_SOURCE, DEFAULT_SYSTEM_SOURCE,
-        DEFAULT_MIC_GAIN, DEFAULT_SYSTEM_GAIN);
+        "  QUICKREC_MIC_SOURCE     gpu-screen-recorder mic source override\n"
+        "  QUICKREC_SYSTEM_SOURCE  gpu-screen-recorder system source override\n",
+        DEFAULT_FPS, DEFAULT_MIC_SOURCE, DEFAULT_SYSTEM_SOURCE);
 }
 
 static int path_join(char *dst, size_t dstsz, const char *a, const char *b)
@@ -335,10 +327,10 @@ static int init_paths(struct app_paths *paths)
     }
 
     if (path_join(paths->state_dir, sizeof(paths->state_dir), state_root, "quickrec") < 0 ||
-        path_join(paths->pidfile, sizeof(paths->pidfile), paths->state_dir, "ffmpeg.pid") < 0 ||
+        path_join(paths->pidfile, sizeof(paths->pidfile), paths->state_dir, "gpu-screen-recorder.pid") < 0 ||
         path_join(paths->indicator_pidfile, sizeof(paths->indicator_pidfile), paths->state_dir, "indicator.pid") < 0 ||
         path_join(paths->outfilefile, sizeof(paths->outfilefile), paths->state_dir, "current_output") < 0 ||
-        path_join(paths->logfile, sizeof(paths->logfile), paths->state_dir, "ffmpeg.log") < 0) {
+        path_join(paths->logfile, sizeof(paths->logfile), paths->state_dir, "gpu-screen-recorder.log") < 0) {
         fprintf(stderr, "quickrec: state path is too long\n");
         return -1;
     }
@@ -505,7 +497,7 @@ static int recorder_running(const struct app_paths *paths, pid_t *pid_out)
     if (read_pid_file(paths->pidfile, &pid) < 0)
         return 0;
 
-    if (!process_alive(pid) || !process_cmdline_contains(pid, "ffmpeg")) {
+    if (!process_alive(pid) || !process_cmdline_contains(pid, "gpu-screen-recorder")) {
         unlink(paths->pidfile);
         return 0;
     }
@@ -873,8 +865,8 @@ static int select_region(struct geometry *geo)
     return 0;
 }
 
-static int spawn_ffmpeg(const struct geometry *geo, const struct start_options *opt,
-                        const struct app_paths *paths, pid_t *pid_out)
+static int spawn_gpu_screen_recorder(const struct geometry *geo, const struct start_options *opt,
+                                     const struct app_paths *paths, pid_t *pid_out)
 {
     int errpipe[2];
     pid_t pid;
@@ -902,9 +894,8 @@ static int spawn_ffmpeg(const struct geometry *geo, const struct start_options *
         char *args[64];
         size_t argi = 0;
         char fpsbuf[16];
-        char sizebuf[64];
-        char inputbuf[128];
-        char filterbuf[512];
+        char regionbuf[64];
+        char audiobuf[1024];
 
         close(errpipe[0]);
 
@@ -941,76 +932,45 @@ static int spawn_ffmpeg(const struct geometry *geo, const struct start_options *
             close(logfd);
 
         snprintf(fpsbuf, sizeof(fpsbuf), "%d", opt->fps);
-        snprintf(sizebuf, sizeof(sizebuf), "%dx%d", geo->w, geo->h);
-        snprintf(inputbuf, sizeof(inputbuf), "%s+%d,%d", opt->display, geo->x, geo->y);
-        if (opt->audio && snprintf(filterbuf, sizeof(filterbuf),
-                                   "[1:a]volume=%s[mic];[2:a]volume=%s[system];[mic][system]amix=inputs=2:duration=longest:dropout_transition=0,aresample=async=1:first_pts=0[a]",
-                                   opt->mic_gain, opt->system_gain) >= (int)sizeof(filterbuf)) {
+        if (snprintf(regionbuf, sizeof(regionbuf), "%dx%d+%d+%d", geo->w, geo->h, geo->x, geo->y) >= (int)sizeof(regionbuf)) {
+            child_errno = ENAMETOOLONG;
+            (void)!write(errpipe[1], &child_errno, sizeof(child_errno));
+            _exit(1);
+        }
+        if (opt->audio && snprintf(audiobuf, sizeof(audiobuf), "%s|%s", opt->mic_source, opt->system_source) >= (int)sizeof(audiobuf)) {
             child_errno = ENAMETOOLONG;
             (void)!write(errpipe[1], &child_errno, sizeof(child_errno));
             _exit(1);
         }
 
-        args[argi++] = "ffmpeg";
-        args[argi++] = "-y";
-        args[argi++] = "-hide_banner";
-        args[argi++] = "-loglevel";
-        args[argi++] = "warning";
-
-        args[argi++] = "-thread_queue_size";
-        args[argi++] = "1024";
+        args[argi++] = "gpu-screen-recorder";
+        args[argi++] = "-w";
+        args[argi++] = "region";
+        args[argi++] = "-region";
+        args[argi++] = regionbuf;
         args[argi++] = "-f";
-        args[argi++] = "x11grab";
-        args[argi++] = "-framerate";
         args[argi++] = fpsbuf;
-        args[argi++] = "-video_size";
-        args[argi++] = sizebuf;
-        args[argi++] = "-i";
-        args[argi++] = inputbuf;
+        args[argi++] = "-c";
+        args[argi++] = "mp4";
+        args[argi++] = "-k";
+        args[argi++] = DEFAULT_VIDEO_CODEC;
+        args[argi++] = "-q";
+        args[argi++] = DEFAULT_QUALITY;
+        args[argi++] = "-cursor";
+        args[argi++] = "yes";
 
         if (opt->audio) {
-            args[argi++] = "-thread_queue_size";
-            args[argi++] = "1024";
-            args[argi++] = "-f";
-            args[argi++] = "pulse";
-            args[argi++] = "-i";
-            args[argi++] = (char *)opt->mic_source;
-
-            args[argi++] = "-thread_queue_size";
-            args[argi++] = "1024";
-            args[argi++] = "-f";
-            args[argi++] = "pulse";
-            args[argi++] = "-i";
-            args[argi++] = (char *)opt->system_source;
-
-            args[argi++] = "-filter_complex";
-            args[argi++] = filterbuf;
-            args[argi++] = "-map";
-            args[argi++] = "0:v:0";
-            args[argi++] = "-map";
-            args[argi++] = "[a]";
-        }
-
-        args[argi++] = "-c:v";
-        args[argi++] = "libx264";
-        args[argi++] = "-preset";
-        args[argi++] = DEFAULT_PRESET;
-        args[argi++] = "-pix_fmt";
-        args[argi++] = "yuv420p";
-
-        if (opt->audio) {
-            args[argi++] = "-c:a";
-            args[argi++] = "aac";
-            args[argi++] = "-b:a";
-            args[argi++] = DEFAULT_AUDIO_BITRATE;
+            args[argi++] = "-a";
+            args[argi++] = audiobuf;
             args[argi++] = "-ac";
-            args[argi++] = "2";
+            args[argi++] = DEFAULT_AUDIO_CODEC;
         }
 
+        args[argi++] = "-o";
         args[argi++] = (char *)opt->output;
         args[argi] = NULL;
 
-        execvp("ffmpeg", args);
+        execvp("gpu-screen-recorder", args);
 
         child_errno = errno;
         (void)!write(errpipe[1], &child_errno, sizeof(child_errno));
@@ -1355,21 +1315,6 @@ static int parse_positive_int(const char *text, const char *label, int *value_ou
     return 0;
 }
 
-static int parse_positive_double(const char *text, const char *label)
-{
-    char *end;
-    double value;
-
-    errno = 0;
-    value = strtod(text, &end);
-    if (errno != 0 || end == text || *end != '\0' || value <= 0.0 || value > 100.0) {
-        fprintf(stderr, "quickrec: invalid %s: %s\n", label, text);
-        return -1;
-    }
-
-    return 0;
-}
-
 static int env_false(const char *value)
 {
     if (!value || !*value)
@@ -1492,22 +1437,11 @@ static int start_recording(int argc, char **argv, const struct app_paths *paths)
     opt.geometry_text = NULL;
     opt.mic_source = getenv("QUICKREC_MIC_SOURCE");
     opt.system_source = getenv("QUICKREC_SYSTEM_SOURCE");
-    opt.mic_gain = getenv("QUICKREC_MIC_GAIN");
-    opt.system_gain = getenv("QUICKREC_SYSTEM_GAIN");
 
     if (!opt.mic_source || !*opt.mic_source)
         opt.mic_source = DEFAULT_MIC_SOURCE;
     if (!opt.system_source || !*opt.system_source)
         opt.system_source = DEFAULT_SYSTEM_SOURCE;
-    if (!opt.mic_gain || !*opt.mic_gain)
-        opt.mic_gain = DEFAULT_MIC_GAIN;
-    if (!opt.system_gain || !*opt.system_gain)
-        opt.system_gain = DEFAULT_SYSTEM_GAIN;
-
-    if (parse_positive_double(opt.mic_gain, "QUICKREC_MIC_GAIN") < 0)
-        return 1;
-    if (parse_positive_double(opt.system_gain, "QUICKREC_SYSTEM_GAIN") < 0)
-        return 1;
 
     if (env_false(getenv("QUICKREC_AUDIO")))
         opt.audio = 0;
@@ -1559,22 +1493,6 @@ static int start_recording(int argc, char **argv, const struct app_paths *paths)
                 return 1;
             }
             opt.system_source = argv[++i];
-        } else if (!strcmp(argv[i], "--mic-gain")) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "quickrec: missing value for %s\n", argv[i]);
-                return 1;
-            }
-            opt.mic_gain = argv[++i];
-            if (parse_positive_double(opt.mic_gain, "mic gain") < 0)
-                return 1;
-        } else if (!strcmp(argv[i], "--system-gain")) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "quickrec: missing value for %s\n", argv[i]);
-                return 1;
-            }
-            opt.system_gain = argv[++i];
-            if (parse_positive_double(opt.system_gain, "system gain") < 0)
-                return 1;
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage(stdout);
             return 0;
@@ -1598,8 +1516,8 @@ static int start_recording(int argc, char **argv, const struct app_paths *paths)
 
     (void)stop_indicator(paths);
 
-    if (!command_exists("ffmpeg")) {
-        fprintf(stderr, "quickrec: ffmpeg is not installed\n");
+    if (!command_exists("gpu-screen-recorder")) {
+        fprintf(stderr, "quickrec: gpu-screen-recorder is not installed\n");
         return 1;
     }
 
@@ -1649,8 +1567,8 @@ static int start_recording(int argc, char **argv, const struct app_paths *paths)
         fprintf(stderr, "quickrec: warning: failed to start recording overlay: %s\n", strerror(errno));
     }
 
-    if (spawn_ffmpeg(&geo, &opt, paths, &pid) < 0) {
-        fprintf(stderr, "quickrec: failed to start ffmpeg: %s\n", strerror(errno));
+    if (spawn_gpu_screen_recorder(&geo, &opt, paths, &pid) < 0) {
+        fprintf(stderr, "quickrec: failed to start gpu-screen-recorder: %s\n", strerror(errno));
         if (have_indicator)
             (void)stop_indicator(paths);
         return 1;
@@ -1659,7 +1577,7 @@ static int start_recording(int argc, char **argv, const struct app_paths *paths)
     usleep(250000);
     status = waitpid(pid, NULL, WNOHANG);
     if (status == pid) {
-        fprintf(stderr, "quickrec: ffmpeg exited immediately; see %s\n", paths->logfile);
+        fprintf(stderr, "quickrec: gpu-screen-recorder exited immediately; see %s\n", paths->logfile);
         if (have_indicator)
             (void)stop_indicator(paths);
         return 1;
