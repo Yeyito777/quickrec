@@ -832,8 +832,18 @@ static int select_region(struct geometry *geo)
 
         case KeyPress:
             key = XLookupKeysym(&ev.xkey, 0);
-            if (key == XK_Escape)
+            if (key == XK_Escape) {
                 cancelled = 1;
+            } else if (key == XK_Return || key == XK_KP_Enter) {
+                if (query_pointer_window_geometry(dpy, root, &pointer_x, &pointer_y, geo) == 0) {
+                    done = 1;
+                } else if (have_hover) {
+                    *geo = hover_geo;
+                    done = 1;
+                } else {
+                    cancelled = 1;
+                }
+            }
             break;
         }
     }
