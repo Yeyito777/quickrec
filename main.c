@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -945,8 +946,6 @@ static int spawn_gpu_screen_recorder(const struct geometry *geo, const struct st
 
         args[argi++] = "gpu-screen-recorder";
         args[argi++] = "-w";
-        args[argi++] = "region";
-        args[argi++] = "-region";
         args[argi++] = regionbuf;
         args[argi++] = "-f";
         args[argi++] = fpsbuf;
@@ -1007,6 +1006,176 @@ static int wait_for_exit(pid_t pid, int timeout_ms)
     }
 
     return process_alive(pid) ? -1 : 0;
+}
+
+static uint32_t read_be32(const unsigned char p[4])
+{
+    return ((uint32_t)p[0] << 24) |
+           ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) |
+           (uint32_t)p[3];
+}
+
+static uint64_t read_be64(const unsigned char p[8])
+{
+    return ((uint64_t)p[0] << 56) |
+           ((uint64_t)p[1] << 48) |
+           ((uint64_t)p[2] << 40) |
+           ((uint64_t)p[3] << 32) |
+           ((uint64_t)p[4] << 24) |
+           ((uint64_t)p[5] << 16) |
+           ((uint64_t)p[6] << 8) |
+           (uint64_t)p[7];
+}
+
+static int read_exact_at(int fd, uint64_t offset, void *buf, size_t len)
+{
+    unsigned char *p = buf;
+
+    while (len > 0) {
+        ssize_t n = pread(fd, p, len, (off_t)offset);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (n == 0) {
+            errno = EINVAL;
+            return -1;
+        }
+        p += n;
+        offset += (uint64_t)n;
+        len -= (size_t)n;
+    }
+
+    return 0;
+}
+
+static int write_exact_at(int fd, uint64_t offset, const void *buf, size_t len)
+{
+    const unsigned char *p = buf;
+
+    while (len > 0) {
+        ssize_t n = pwrite(fd, p, len, (off_t)offset);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (n == 0) {
+            errno = EIO;
+            return -1;
+        }
+        p += n;
+        offset += (uint64_t)n;
+        len -= (size_t)n;
+    }
+
+    return 0;
+}
+
+static int box_type_is(const unsigned char type[4], const char name[4])
+{
+    return memcmp(type, name, 4) == 0;
+}
+
+static int sanitize_mp4_track_name_boxes(int fd, uint64_t start, uint64_t end,
+                                         int in_trak, int in_udta, int *patched)
+{
+    uint64_t pos = start;
+
+    while (pos + 8 <= end) {
+        unsigned char header[16];
+        unsigned char *type = header + 4;
+        uint64_t size;
+        uint64_t header_size = 8;
+        uint64_t child_start;
+        uint64_t child_end;
+
+        if (read_exact_at(fd, pos, header, 8) < 0)
+            return -1;
+
+        size = read_be32(header);
+        if (size == 1) {
+            if (pos + 16 > end) {
+                errno = EINVAL;
+                return -1;
+            }
+            if (read_exact_at(fd, pos + 8, header + 8, 8) < 0)
+                return -1;
+            size = read_be64(header + 8);
+            header_size = 16;
+        } else if (size == 0) {
+            size = end - pos;
+        }
+
+        if (size < header_size || size > end - pos) {
+            errno = EINVAL;
+            return -1;
+        }
+
+        child_start = pos + header_size;
+        child_end = pos + size;
+
+        if (in_trak && in_udta && box_type_is(type, "name")) {
+            if (write_exact_at(fd, pos + 4, "free", 4) < 0)
+                return -1;
+            ++*patched;
+        } else if (box_type_is(type, "moov")) {
+            if (sanitize_mp4_track_name_boxes(fd, child_start, child_end, 0, 0, patched) < 0)
+                return -1;
+        } else if (box_type_is(type, "trak")) {
+            if (sanitize_mp4_track_name_boxes(fd, child_start, child_end, 1, 0, patched) < 0)
+                return -1;
+        } else if (box_type_is(type, "udta")) {
+            if (sanitize_mp4_track_name_boxes(fd, child_start, child_end, in_trak, 1, patched) < 0)
+                return -1;
+        }
+
+        pos += size;
+    }
+
+    return 0;
+}
+
+static int sanitize_mp4_track_metadata(const char *path)
+{
+    int fd;
+    struct stat st;
+    int patched = 0;
+
+    if (!path || !*path) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    fd = open(path, O_RDWR);
+    if (fd < 0)
+        return -1;
+
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    if (st.st_size < 0 || sanitize_mp4_track_name_boxes(fd, 0, (uint64_t)st.st_size, 0, 0, &patched) < 0) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    if (patched > 0 && fsync(fd) < 0) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    if (close(fd) < 0)
+        return -1;
+
+    return patched;
 }
 
 static volatile sig_atomic_t indicator_running = 1;
@@ -1640,6 +1809,12 @@ static int stop_recording(const struct app_paths *paths)
 
     if (stop_indicator(paths) < 0)
         fprintf(stderr, "quickrec: warning: failed to stop indicator: %s\n", strerror(errno));
+
+    if (outfile[0] != '\0' && access(outfile, F_OK) == 0) {
+        int sanitized = sanitize_mp4_track_metadata(outfile);
+        if (sanitized < 0)
+            fprintf(stderr, "quickrec: warning: failed to sanitize MP4 track metadata: %s\n", strerror(errno));
+    }
 
     maybe_rename_recording_with_dmenu(paths, outfile, sizeof(outfile));
 

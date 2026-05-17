@@ -62,6 +62,7 @@ export QUICKREC_OUTPUT_DIR=/some/other/dir
 - selected regions are automatically nudged to even dimensions for H.264
 - current codec settings are intentionally simple: `h264`, `very_high`, `aac`, `mp4`
 - audio defaults to `default_input|default_output` for mic + system audio
+- after recording, quickrec sanitizes gpu-screen-recorder's MP4 track-name metadata in-place to avoid FFmpeg `UDTA` warnings
 - gpu-screen-recorder logs go to `~/.local/state/quickrec/gpu-screen-recorder.log`
 
 ## License
