@@ -14,6 +14,7 @@ Tiny C X11 screen-region recorder built around a custom selector plus `gpu-scree
 ## Dependencies
 
 - `gpu-screen-recorder`
+- `ffmpeg` (for post-recording mic/system gain mixing)
 - `dmenu` (for naming the finished recording when you stop)
 - X11 (`DISPLAY` must be set)
 
@@ -41,6 +42,7 @@ quickrec start -f 30
 quickrec start -o recordings/test.mp4
 quickrec start --no-audio
 quickrec start --mic-source default_input --system-source default_output
+quickrec start --mic-gain 7.875 --system-gain 0.675
 
 # while recording, Ctrl+Shift+Esc triggers the normal stop flow
 ```
@@ -61,7 +63,8 @@ export QUICKREC_OUTPUT_DIR=/some/other/dir
 
 - selected regions are automatically nudged to even dimensions for H.264
 - current codec settings are intentionally simple: `h264`, `very_high`, `aac`, `mp4`
-- audio defaults to `default_input|default_output` for mic + system audio
+- audio defaults to separate `default_input` and `default_output` tracks, then ffmpeg mixes them after recording
+- default post-processing gains match the old ffmpeg backend: mic `7.875`, system `0.675`
 - after recording, quickrec sanitizes gpu-screen-recorder's MP4 track-name metadata in-place to avoid FFmpeg `UDTA` warnings
 - gpu-screen-recorder logs go to `~/.local/state/quickrec/gpu-screen-recorder.log`
 
